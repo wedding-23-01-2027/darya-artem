@@ -1,60 +1,143 @@
-// Замените ВЕСЬ код файла Код.gs этим кодом. Затем обновите развёртывание.
-const HEADERS=['Дата и время','Имя и фамилия','Присутствие','С парой','Имя пары','С детьми','Имена детей','Взрослых','Детей','ID ответа'];
+// Дарья & Артём — подтверждаем сохранение анкеты и отправку Telegram.
+// Свойства проекта: TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID (уже сохранены).
+// Развернуть как веб-приложение: выполнять от имени «Меня», доступ «Все».
 
-function doPost(e){
-  const lock=LockService.getScriptLock();
-  try{
-    lock.waitLock(20000);
-    const data=JSON.parse((e.parameter&&e.parameter.payload)||'{}');
-    if(data.website) return json_({ok:true}); // скрытое поле-ловушка
-    const name=clean_(data.name,120);
-    const id=clean_(data.submissionId,100);
-    const attendance=data.attendance;
-    if(!name||!id||!['yes','no'].includes(attendance)) throw Error('Некорректная анкета');
-    const coming=attendance==='yes';
-    const partner=coming&&data.partner==='yes';
-    const withChildren=coming&&data.children==='yes';
-    if(coming&&!['yes','no'].includes(data.partner))throw Error('Не указан ответ о паре');
-    if(coming&&!['yes','no'].includes(data.children))throw Error('Не указан ответ о детях');
-    const partnerName=partner?clean_(data.partnerName,120):'';
-    const childrenNames=withChildren&&Array.isArray(data.childrenNames)
-      ?data.childrenNames.slice(0,15).map(x=>clean_(x,120)).filter(Boolean):[];
-    if(partner&&!partnerName)throw Error('Не указано имя пары');
-    if(withChildren&&!childrenNames.length)throw Error('Не указаны дети');
-    const sheet=SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
-    if(sheet.getLastRow()===0)sheet.appendRow(HEADERS);
-    // Повторное нажатие / повторная отправка того же ID не создаёт дубликат.
-    const last=sheet.getLastRow();
-    if(last>1){
-      const ids=sheet.getRange(2,10,last-1,1).getDisplayValues().flat();
-      if(ids.includes(id))return json_({ok:true,duplicate:true});
-    }
-    const adults=coming?(partner?2:1):0;
-    sheet.appendRow([new Date(),safeCell_(name),coming?'Да':'Нет',partner?'Да':'Нет',
-      safeCell_(partnerName),withChildren?'Да':'Нет',safeCell_(childrenNames.join(', ')),
-      adults,childrenNames.length,id]);
-    const props=PropertiesService.getScriptProperties();
-    const token=props.getProperty('TELEGRAM_BOT_TOKEN');
-    const chatId=props.getProperty('TELEGRAM_CHAT_ID');
-    if(token&&chatId){
-      const msg='💌 Новый ответ на приглашение!\n\n'+
-        '👤 Гость: '+name+'\n'+
-        '💍 Придёт: '+(coming?'Да':'Нет')+'\n'+
-        '🤍 Пара: '+(partner?partnerName:'Нет')+'\n'+
-        '👶 Дети: '+(childrenNames.join(', ')||'Нет')+'\n'+
-        '👥 Взрослых: '+adults+'; детей: '+childrenNames.length;
-      try{
-        const response=UrlFetchApp.fetch('https://api.telegram.org/bot'+token+'/sendMessage',{
-          method:'post',contentType:'application/json',
-          payload:JSON.stringify({chat_id:chatId,text:msg}),muteHttpExceptions:true
-        });
-        if(response.getResponseCode()!==200)console.error('Telegram: '+response.getContentText());
-      }catch(err){console.error('Telegram: '+err)}
-    }
-    return json_({ok:true});
-  }catch(err){console.error(err);return json_({ok:false,error:String(err)})}
-  finally{try{lock.releaseLock()}catch(e){}}
+const RSVP_HEADERS = ['Дата ответа','Имя и фамилия','Присутствие','Имя пары','Дети','Количество взрослых','Количество детей','ID анкеты','Статус Telegram'];
+
+function isYes(value) {
+  return ['yes','да','true','1','буду','приду'].includes(String(value || '').trim().toLowerCase());
 }
-function clean_(value,max){return String(value||'').trim().slice(0,max)}
-function safeCell_(value){return /^[=+\-@]/.test(value)?"'"+value:value}
-function json_(data){return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON)}
+
+function jsonResponse(value) {
+  return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function getSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Не найдена Google Таблица');
+  const sheet = ss.getSheets()[0];
+  if (sheet.getLastRow() === 0) sheet.appendRow(RSVP_HEADERS);
+  else {
+    // Если заголовки созданы старым скриптом, добавляем два новых столбца.
+    if (sheet.getRange(1, 8).getValue() !== 'ID анкеты') sheet.getRange(1, 8).setValue('ID анкеты');
+    if (sheet.getRange(1, 9).getValue() !== 'Статус Telegram') sheet.getRange(1, 9).setValue('Статус Telegram');
+  }
+  return sheet;
+}
+
+function findRow_(sheet, id) {
+  const last = sheet.getLastRow();
+  if (last < 2) return 0;
+  const cell = sheet.getRange(2, 8, last - 1, 1).createTextFinder(id).matchEntireCell(true).findNext();
+  return cell ? cell.getRow() : 0;
+}
+
+function statusKey_(id) { return 'rsvp_' + id; }
+function setStatus_(id, state, message) {
+  CacheService.getScriptCache().put(statusKey_(id), JSON.stringify({status:state, message:message || ''}), 21600);
+}
+
+function doPost(e) {
+  let id = '';
+  try {
+    if (!e) throw new Error('Пустой запрос');
+    let data;
+    if (e.parameter && e.parameter.payload) data = JSON.parse(e.parameter.payload);
+    else if (e.postData && e.postData.contents) data = JSON.parse(e.postData.contents);
+    else throw new Error('Не получена анкета');
+    id = String(data.submissionId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{8,100}$/.test(id)) throw new Error('Некорректный ID анкеты');
+    const result = saveGuestResponse_(data, id);
+    return jsonResponse(result);
+  } catch (error) {
+    console.error('ОШИБКА АНКЕТЫ: ' + error.message, error.stack);
+    if (id) setStatus_(id, 'error', 'Не удалось обработать анкету');
+    return jsonResponse({success:false, error:'Не удалось обработать анкету'});
+  }
+}
+
+function saveGuestResponse_(data, id) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const name = String(data.name || '').trim();
+    if (!name || name.length > 120) throw new Error('Укажите имя и фамилию');
+    if (!['yes','no'].includes(String(data.attendance))) throw new Error('Не указан ответ о присутствии');
+    if (data.website) throw new Error('Некорректный запрос');
+    const attending = data.attendance === 'yes';
+    const partner = attending && isYes(data.partner) ? String(data.partnerName || '').trim() : '';
+    const children = attending && isYes(data.children) && Array.isArray(data.childrenNames)
+      ? data.childrenNames.map(x => String(x || '').trim()).filter(Boolean) : [];
+    if (partner.length > 120 || children.length > 20 || children.some(x => x.length > 120)) throw new Error('Некорректные данные анкеты');
+    const sheet = getSheet_();
+    let row = findRow_(sheet, id);
+    if (row && sheet.getRange(row, 9).getValue() === 'Отправлено') {
+      setStatus_(id, 'success', 'Ответ сохранён');
+      return {success:true};
+    }
+    if (!row) {
+      sheet.appendRow([new Date(), safeCell_(name), attending ? 'Да' : 'Нет', safeCell_(partner),
+        safeCell_(children.join(', ')), attending ? (partner ? 2 : 1) : 0,
+        attending ? children.length : 0, id, 'Ожидает отправки']);
+      row = sheet.getLastRow();
+    }
+    const props = PropertiesService.getScriptProperties();
+    const token = props.getProperty('TELEGRAM_BOT_TOKEN');
+    const chatId = props.getProperty('TELEGRAM_CHAT_ID');
+    if (!token || !chatId) throw new Error('Не настроен Telegram');
+    const message = '💌 Новый ответ на свадебное приглашение!\n\n' +
+      '👤 Гость: ' + name + '\n' + '💍 Присутствие: ' + (attending ? 'Да' : 'Нет') + '\n' +
+      '🤍 Пара: ' + (partner || 'Нет') + '\n' + '👶 Дети: ' + (children.join(', ') || 'Нет') + '\n\n' +
+      '👥 Взрослых: ' + (attending ? (partner ? 2 : 1) : 0) + '\n' +
+      '🧸 Детей: ' + (attending ? children.length : 0);
+    const response = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+      method:'post', contentType:'application/json',
+      payload:JSON.stringify({chat_id:chatId, text:message}), muteHttpExceptions:true
+    });
+    const result = JSON.parse(response.getContentText());
+    if (!result.ok) throw new Error('Telegram: ' + (result.description || 'ошибка'));
+    sheet.getRange(row, 9).setValue('Отправлено');
+    SpreadsheetApp.flush();
+    setStatus_(id, 'success', 'Ответ сохранён');
+    console.log('Успешно: ' + name + ' / ' + id);
+    return {success:true};
+  } catch (error) {
+    console.error('ОШИБКА СОХРАНЕНИЯ: ' + error.message, error.stack);
+    setStatus_(id, 'error', 'Не удалось завершить отправку');
+    throw error;
+  } finally { lock.releaseLock(); }
+}
+
+// Защита от интерпретации введённых имён как формул в Google Таблице.
+function safeCell_(text) {
+  const value = String(text || '');
+  return /^[=+@\-]/.test(value) ? "'" + value : value;
+}
+
+// Проверка состояния через JSONP: работает с GitHub Pages без CORS.
+// Возвращаем только состояние, без персональных данных.
+function doGet(e) {
+  const id = String(e && e.parameter && e.parameter.id || '');
+  const callback = String(e && e.parameter && e.parameter.callback || '');
+  if (!/^[a-zA-Z0-9_-]{8,100}$/.test(id) || !/^[a-zA-Z_$][a-zA-Z0-9_$]{0,80}$/.test(callback)) {
+    return ContentService.createTextOutput('Некорректный запрос').setMimeType(ContentService.MimeType.TEXT);
+  }
+  let state = {status:'pending'};
+  const cached = CacheService.getScriptCache().get(statusKey_(id));
+  if (cached) state = JSON.parse(cached);
+  else {
+    const sheet = getSheet_();
+    const row = findRow_(sheet, id);
+    if (row) state = {status:sheet.getRange(row, 9).getValue() === 'Отправлено' ? 'success' : 'pending'};
+  }
+  return ContentService.createTextOutput(callback + '(' + JSON.stringify(state) + ');')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+// Внутренний тест: создаёт строку и отправляет уведомление в Telegram.
+function testForm() {
+  const id = 'test_' + Utilities.getUuid().replace(/-/g, '');
+  const result = saveGuestResponse_({submissionId:id, name:'Тестовый Гость', attendance:'yes',
+    partner:'yes', partnerName:'Тестовая Пара', children:'yes', childrenNames:['Тестовый Ребёнок']}, id);
+  Logger.log(JSON.stringify(result));
+}

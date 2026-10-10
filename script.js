@@ -48,13 +48,65 @@ document.addEventListener('keydown',event=>{
 });
 const submitButton=form.querySelector('button[type="submit"]');
 let pendingSubmissionId=null;
+// Проверяем результат через отдельный GET-запрос. POST с no-cors сам по себе
+// НЕ подтверждает сохранение; успешный ответ показывает только статус success.
+function checkSubmissionStatus(id, timeoutMs=55000){
+  return new Promise((resolve,reject)=>{
+    const started=Date.now();
+    let settled=false;
+    let activeScript=null;
+    let activeCallback=null;
+    let timer=null;
+    const finish=(error,result)=>{
+      if(settled)return;
+      settled=true;
+      clearTimeout(timer);
+      if(activeScript)activeScript.remove();
+      if(activeCallback)delete window[activeCallback];
+      if(error)reject(error);else resolve(result);
+    };
+    const poll=()=>{
+      if(settled)return;
+      if(Date.now()-started>=timeoutMs){finish(new Error('timeout'));return;}
+      const callback='rsvpStatus_'+Math.random().toString(36).slice(2);
+      const script=document.createElement('script');
+      activeCallback=callback;
+      activeScript=script;
+      let answered=false;
+      const watchdog=setTimeout(()=>{
+        if(answered||settled)return;
+        answered=true;
+        script.remove();delete window[callback];
+        timer=setTimeout(poll,1600);
+      },6500);
+      window[callback]=(result)=>{
+        if(answered||settled)return;
+        answered=true;
+        clearTimeout(watchdog);
+        script.remove();delete window[callback];
+        if(result?.status==='success'){finish(null,result);return;}
+        if(result?.status==='error'){finish(new Error('server'));return;}
+        timer=setTimeout(poll,1700);
+      };
+      script.onerror=()=>{
+        if(answered||settled)return;
+        answered=true;clearTimeout(watchdog);
+        script.remove();delete window[callback];
+        timer=setTimeout(poll,1700);
+      };
+      script.src=RSVP_ENDPOINT+'?id='+encodeURIComponent(id)+'&callback='+callback+'&t='+Date.now();
+      document.head.append(script);
+    };
+    poll();
+  });
+}
 form.addEventListener('submit',async event=>{
   event.preventDefault();
   if(!form.reportValidity()||submitButton.disabled)return;
   const data=new FormData(form);
   const attendance=data.get('attendance');
   const item={
-    submissionId:pendingSubmissionId||(pendingSubmissionId=crypto.randomUUID()),
+    submissionId:pendingSubmissionId||(pendingSubmissionId=(crypto.randomUUID?crypto.randomUUID():'id_'+Date.now()+'_'+Math.random().toString(36).slice(2))),
     name:String(data.get('name')||'').trim(),
     attendance,
     partner:attendance==='yes'?data.get('partner'):'no',
@@ -67,22 +119,24 @@ form.addEventListener('submit',async event=>{
   formMessage.textContent='';
   showModal();
   try{
-    // Apps Script не поддерживает обычную CORS-проверку ответа с GitHub Pages.
-    // no-cors отправляет запрос, но браузер не может подтвердить запись в таблицу.
-    await fetch(RSVP_ENDPOINT,{
+    // Запускаем проверку ДО отправки, чтобы не пропустить быстрый ответ сервера.
+    const confirmed=checkSubmissionStatus(item.submissionId);
+    // Оpaque-ответ не является подтверждением. Проверка продолжается отдельно.
+    fetch(RSVP_ENDPOINT,{
       method:'POST',mode:'no-cors',redirect:'follow',
       headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
       body:new URLSearchParams({payload:JSON.stringify(item)})
-    });
-    finishModal('sent','Спасибо за ваш ответ!','Анкета отправлена. Мы будем очень рады разделить с вами этот день!');
+    }).catch(()=>{});
+    await confirmed;
+    finishModal('sent','Спасибо за ваш ответ!','Ваш ответ получен и сохранён. Спасибо, что ответили на приглашение!');
     form.reset();
     childrenList.querySelectorAll('.child-entry:not(:first-child)').forEach(row=>row.remove());
     childIndex=1;
     pendingSubmissionId=null;
     updateFields();
   }catch(error){
-    finishModal('error','Не удалось отправить','Проверьте подключение к интернету и попробуйте ещё раз. Данные в анкете сохранились.');
-  }finally{submitButton.disabled=false}
+    finishModal('error','Не удалось подтвердить отправку','Мы не получили подтверждение от сервера. Пожалуйста, попробуйте ещё раз. Ваши ответы сохранены в анкете. Если ошибка повторится, свяжитесь с нами лично.');
+  }finally{submitButton.disabled=false;}
 });
 updateFields();
 
