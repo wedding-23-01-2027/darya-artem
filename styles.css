@@ -250,3 +250,17 @@ body.modal-open{overflow:hidden}
 @keyframes modalArrive{from{opacity:0;transform:translateY(18px) scale(.985)}to{opacity:1;transform:none}}
 @media(max-width:560px){.rsvp-modal{padding:17px}.rsvp-modal-card{padding:42px 24px 40px;min-height:350px}.rsvp-modal-eyebrow{font-size:8px}.rsvp-modal-card h2{font-size:42px}}
 @media(prefers-reduced-motion:reduce){.rsvp-modal-card,.rsvp-modal-spinner{animation:none!important}}
+
+/* Final smoothness pass: lighter compositing on phones, no expensive particle filters. */
+.flake{filter:none!important;box-shadow:0 0 3px rgba(255,255,255,.35);will-change:transform}
+.snow{contain:layout style paint}
+.rsvp-modal-ornament{display:flex;align-items:center;justify-content:center;height:35px;margin:0 auto 20px;color:#a68b69}
+.rsvp-modal-ornament svg{display:block;flex:none}
+.rsvp-modal-card{will-change:transform,opacity}
+.rsvp-modal-backdrop{backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+@media(max-width:700px){
+ .hero-photo img{animation:none!important}
+ .rsvp-modal-backdrop{backdrop-filter:none;-webkit-backdrop-filter:none}
+ .rsvp-modal-card{animation:modalArrive .36s ease-out both}
+}
+@media(prefers-reduced-motion:reduce){.flake{display:none!important}.rsvp-modal-card{will-change:auto}}
